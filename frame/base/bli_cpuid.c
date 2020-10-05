@@ -435,9 +435,6 @@ arch_t bli_cpuid_query_id( void )
 {
 	uint32_t vendor, model, part, features;
 
-	// Call the CPUID instruction and parse its results into a model id,
-	// part id, and a feature bit field. The return value encodes the
-	// vendor.
 	vendor = bli_cpuid_query( &model, &part, &features );
 
 #if 0
@@ -455,6 +452,10 @@ arch_t bli_cpuid_query_id( void )
 		{
 			// Check for each ARMv8 configuration that is enabled, check for that
 			// microarchitecture. We check from most recent to most dated.
+#ifdef BLIS_CONFIG_A64FX
+			if ( bli_cpuid_is_a64fx( model, part, features ) )
+				return BLIS_ARCH_A64FX;
+#endif
 #ifdef BLIS_CONFIG_THUNDERX2
 			if ( bli_cpuid_is_thunderx2( model, part, features ) )
 				return BLIS_ARCH_THUNDERX2;
@@ -462,6 +463,10 @@ arch_t bli_cpuid_query_id( void )
 #ifdef BLIS_CONFIG_CORTEXA57
 			if ( bli_cpuid_is_cortexa57( model, part, features ) )
 				return BLIS_ARCH_CORTEXA57;
+#endif
+#ifdef BLIS_CONFIG_CORTEXA53
+		if ( bli_cpuid_is_cortexa53( model, part, features ) )
+			return BLIS_ARCH_CORTEXA53;
 #endif
 			// If none of the other sub-configurations were detected, return
 			// the 'generic' arch_t id value.
@@ -492,6 +497,16 @@ arch_t bli_cpuid_query_id( void )
 	return BLIS_ARCH_GENERIC;
 }
 
+bool bli_cpuid_is_a64fx
+     (
+       uint32_t family,
+       uint32_t model,
+       uint32_t features
+     )
+{
+	return model == BLIS_ARCH_A64FX;
+}
+
 bool bli_cpuid_is_thunderx2
      (
        uint32_t family,
@@ -499,12 +514,7 @@ bool bli_cpuid_is_thunderx2
        uint32_t features
      )
 {
-	// Check for expected CPU features.
-	const uint32_t expected = FEATURE_NEON;
-
-	if ( !bli_cpuid_has_features( features, expected ) ) return FALSE;
-
-	return TRUE;
+	return model == BLIS_ARCH_THUNDERX2;
 }
 
 bool bli_cpuid_is_cortexa57
@@ -514,12 +524,7 @@ bool bli_cpuid_is_cortexa57
        uint32_t features
      )
 {
-	// Check for expected CPU features.
-	const uint32_t expected = FEATURE_NEON;
-
-	if ( !bli_cpuid_has_features( features, expected ) ) return FALSE;
-
-	return TRUE;
+	return model == BLIS_ARCH_CORTEXA57;
 }
 
 bool bli_cpuid_is_cortexa53
@@ -529,12 +534,7 @@ bool bli_cpuid_is_cortexa53
        uint32_t features
      )
 {
-	// Check for expected CPU features.
-	const uint32_t expected = FEATURE_NEON;
-
-	if ( !bli_cpuid_has_features( features, expected ) ) return FALSE;
-
-	return TRUE;
+	return model == BLIS_ARCH_CORTEXA53;
 }
 
 bool bli_cpuid_is_cortexa15
@@ -547,9 +547,7 @@ bool bli_cpuid_is_cortexa15
 	// Check for expected CPU features.
 	const uint32_t expected = FEATURE_NEON;
 
-	if ( !bli_cpuid_has_features( features, expected ) ) return FALSE;
-
-	return TRUE;
+	return bli_cpuid_has_features( features, expected ) && model == 0xc0f;
 }
 
 bool bli_cpuid_is_cortexa9
@@ -562,9 +560,7 @@ bool bli_cpuid_is_cortexa9
 	// Check for expected CPU features.
 	const uint32_t expected = FEATURE_NEON;
 
-	if ( !bli_cpuid_has_features( features, expected ) ) return FALSE;
-
-	return TRUE;
+	return bli_cpuid_has_features( features, expected ) && model == 0xc09;
 }
 
 #endif
@@ -985,7 +981,262 @@ int vpu_count( void )
 	}
 }
 
-#elif defined(__aarch64__) || defined(__arm__) || defined(_M_ARM)
+#elif defined(__aarch64__)
+
+#if __linux__
+// This is adapted from OpenBLAS.  See
+// https://www.kernel.org/doc/html/latest/arm64/cpu-feature-registers.html
+// for the mechanism, but not the magic numbers.
+
+// Fixme:  Could these be missing in older Linux?
+#include <asm/hwcap.h>
+#include <sys/auxv.h>
+
+#ifndef HWCAP_CPUID
+#define HWCAP_CPUID (1 << 11)
+#endif
+/* From https://www.kernel.org/doc/html/latest/arm64/sve.html and the
+   aarch64 hwcap.h */
+#ifndef HWCAP_SVE
+#define HWCAP_SVE (1 << 22)
+#endif
+/* Maybe also for AT_HWCAP2
+#define HWCAP2_SVE2(1 << 1)
+et al
+) */
+
+static uint32_t get_coretype(void) {
+	int implementer, part, midr_el1;
+
+// Fixme:  Presumably we should be checking the vector length as the
+// imlementation isn't length-agnostic.
+// #ifdef BLI_ARCH_ARMSVE          /* invented -- fixme */
+// 	if (!(getauxval(AT_HWCAP) & HWCAP_SVE)) {
+// 		/* Assuming no support for specific models */
+// 		return BLI_ARCH_ARMSVE;
+// 	}
+// #endif
+
+	if (!(getauxval(AT_HWCAP) & HWCAP_CPUID)) {
+		// Fixme:  We could try reading /sys and /proc here, as below.
+		// Find out if that could work when the HWCAP test fails.
+		// https://github.com/xianyi/OpenBLAS/issues/2715 says HWCAP_CPUID
+		// is a Linux 4.11 feature and that sys/.../midr_el1 is a 4.7
+		// feature.  Should caution somewhere about binding to big cores
+		// in big-little CPUs.
+		return 0;
+	}
+	// Also available from
+	// /sys/devices/system/cpu/cpu0/regs/identification/midr_el1
+	// and split out in /proc/cpuinfo (with a tab before the colon):
+	// CPU part	: 0x0a1
+	__asm("mrs %0, MIDR_EL1" : "=r" (midr_el1));
+	/*
+	 * MIDR_EL1
+	 *
+	 * 31		   24 23	 20 19			16 15		   4 3		  0
+	 * -----------------------------------------------------------------
+	 * | Implementer | Variant | Architecture | Part Number | Revision |
+	 * -----------------------------------------------------------------
+	 */
+	implementer = (midr_el1 >> 24) & 0xFF;
+	part		= (midr_el1 >> 4)  & 0xFFF;
+	// From Linux arch/arm64/include/asm/cputype.h
+	// ARM_CPU_IMP_ARM 0x41
+	// ARM_CPU_IMP_APM 0x50
+	// ARM_CPU_IMP_CAVIUM 0x43
+	// ARM_CPU_IMP_BRCM 0x42
+	// ARM_CPU_IMP_QCOM 0x51
+	// ARM_CPU_IMP_NVIDIA 0x4E
+	// ARM_CPU_IMP_FUJITSU 0x46
+	// ARM_CPU_IMP_HISI 0x48
+	//
+	// ARM_CPU_PART_AEM_V8 0xD0F
+	// ARM_CPU_PART_FOUNDATION 0xD00
+	// ARM_CPU_PART_CORTEX_A57 0xD07
+	// ARM_CPU_PART_CORTEX_A72 0xD08
+	// ARM_CPU_PART_CORTEX_A53 0xD03
+	// ARM_CPU_PART_CORTEX_A73 0xD09
+	// ARM_CPU_PART_CORTEX_A75 0xD0A
+	// ARM_CPU_PART_CORTEX_A35 0xD04
+	// ARM_CPU_PART_CORTEX_A55 0xD05
+	// ARM_CPU_PART_CORTEX_A76 0xD0B
+	// ARM_CPU_PART_NEOVERSE_N1 0xD0C
+	//
+	// APM_CPU_PART_POTENZA 0x000
+	//
+	// CAVIUM_CPU_PART_THUNDERX 0x0A1
+	// CAVIUM_CPU_PART_THUNDERX_81XX 0x0A2
+	// CAVIUM_CPU_PART_THUNDERX_83XX 0x0A3
+	// CAVIUM_CPU_PART_THUNDERX2 0x0AF
+	// CAVIUM_CPU_PART_THUNDERX3 0x0B8  // taken from OpenBLAS
+	//
+	// BRCM_CPU_PART_BRAHMA_B53 0x100 
+	// BRCM_CPU_PART_VULCAN 0x516
+	//
+	// QCOM_CPU_PART_FALKOR_V1 0x800
+	// QCOM_CPU_PART_FALKOR 0xC00
+	// QCOM_CPU_PART_KRYO 0x200
+        // QCOM_CPU_PART_KRYO_3XX_SILVER 0x803
+        // QCOM_CPU_PART_KRYO_4XX_GOLD 0x804
+        // QCOM_CPU_PART_KRYO_4XX_SILVER 0x805
+	//
+	// NVIDIA_CPU_PART_DENVER 0x003
+	// NVIDIA_CPU_PART_CARMEL 0x004
+	//
+	// FUJITSU_CPU_PART_A64FX 0x001
+	//
+	// HISI_CPU_PART_TSV110 0xD01
+
+	// Fixme:  After merging the vpu_count branch we could report the
+	// part here with bli_dolog.
+	switch(implementer)
+	{
+		case 0x41:		// ARM
+			switch (part)
+			{
+				case 0xd07: // Cortex A57
+					return BLIS_ARCH_CORTEXA57;
+				case 0xd03: // Cortex A53
+					return BLIS_ARCH_CORTEXA53;
+			}
+			break;
+		case 0x42:		// Broadcom
+			switch (part)
+			{
+				case 0x516: // Vulcan
+					return BLIS_ARCH_THUNDERX2;
+			}
+			break;
+		case 0x43:		// Cavium
+			switch (part)
+			{
+				case 0x0af: // ThunderX2
+				case 0x0b8: // ThunderX3
+					return BLIS_ARCH_THUNDERX2;
+			}
+			break;
+		case 0x46:      // Fujitsu
+			switch (part)
+			{
+				case 0x001: // A64FX
+					return BLIS_ARCH_A64FX;
+			}
+			break;
+        // Fixme: OpenBLAS 
+	}
+	// Fixme: OpenBLAS uses a57 basic config for others, but says
+	// -mtune will speed them up
+	// <https://github.com/xianyi/OpenBLAS/commit/310ea55f29f16771438386fb2f1f140e2fd7e397>
+	// It has Neoverse-N1 as -march=armv8.2-a -mtune=neoverse-n1 (gcc
+	// 9+, else v8-a a72) plus some TX2 level 1 and 2 bits; as gravitin2, l1d 64k, l2 1024, l3 32M, Features        : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp ssbs
+	return BLIS_ARCH_CORTEXA57;
+}
+#endif
+
+uint32_t bli_cpuid_query
+     (
+       uint32_t* model,
+       uint32_t* part,
+       uint32_t* features
+     )
+{
+	*model	  = MODEL_ARMV8;
+	*part     = 0;
+	*features = 0;
+#if __linux__
+	*part	  = get_coretype();
+#endif
+
+	return VENDOR_ARM;
+}
+
+#elif defined(__arm__) || defined(_M_ARM)
+
+/* 
+   I can't easily find documentation to do this as for aarch64, though
+   it presumably could be unearthed from Linux code.  However, on
+   Linux 5.2 (and Androids's 3.4), /proc/cpuinfo has this sort of
+   thing, used below:
+
+   CPU implementer	: 0x41
+   CPU architecture: 7
+   CPU variant	: 0x3
+   CPU part	: 0xc09
+
+   The complication for family selection is that Neon is optional for
+   CortexA9, for instance.  That's tested in bli_cpuid_is_cortexa9.
+
+   When reading /proc/cpuinfo, we should check the entry corresponding
+   to the core we're actually running on, in case the system is
+   heterogeneous (big.little).
+
+   arch/arm/include/asm/cputype.h has:
+
+   ARM_CPU_IMP_ARM			0x41
+   ARM_CPU_IMP_BRCM		0x42
+   ARM_CPU_IMP_DEC			0x44
+   ARM_CPU_IMP_INTEL		0x69
+
+   ARM implemented processors 
+   ARM_CPU_PART_ARM1136		0x4100b360
+   ARM_CPU_PART_ARM1156		0x4100b560
+   ARM_CPU_PART_ARM1176		0x4100b760
+   ARM_CPU_PART_ARM11MPCORE	0x4100b020
+   ARM_CPU_PART_CORTEX_A8		0x4100c080
+   ARM_CPU_PART_CORTEX_A9		0x4100c090
+   ARM_CPU_PART_CORTEX_A5		0x4100c050
+   ARM_CPU_PART_CORTEX_A7		0x4100c070
+   ARM_CPU_PART_CORTEX_A12		0x4100c0d0
+   ARM_CPU_PART_CORTEX_A17		0x4100c0e0
+   ARM_CPU_PART_CORTEX_A15		0x4100c0f0
+   ARM_CPU_PART_CORTEX_A53		0x4100d030
+   ARM_CPU_PART_CORTEX_A57		0x4100d070
+   ARM_CPU_PART_CORTEX_A72		0x4100d080
+   ARM_CPU_PART_CORTEX_A73		0x4100d090
+   ARM_CPU_PART_CORTEX_A75		0x4100d0a0
+   ARM_CPU_PART_MASK		0xff00fff0
+
+   Broadcom implemented processors 
+   ARM_CPU_PART_BRAHMA_B15		0x420000f0
+   ARM_CPU_PART_BRAHMA_B53		0x42001000
+
+   DEC implemented cores 
+   ARM_CPU_PART_SA1100		0x4400a110
+
+   Intel implemented cores 
+   ARM_CPU_PART_SA1110		0x6900b110
+   ARM_CPU_REV_SA1110_A0		0
+   ARM_CPU_REV_SA1110_B0		4
+   ARM_CPU_REV_SA1110_B1		5
+   ARM_CPU_REV_SA1110_B2		6
+   ARM_CPU_REV_SA1110_B4		8
+
+   ARM_CPU_XSCALE_ARCH_MASK	0xe000
+   ARM_CPU_XSCALE_ARCH_V1		0x2000
+   ARM_CPU_XSCALE_ARCH_V2		0x4000
+   ARM_CPU_XSCALE_ARCH_V3		0x6000
+
+   Qualcomm implemented cores
+   ARM_CPU_PART_SCORPION		0x510002d0
+
+   The list must be pretty incomplete.  A phone example in Android:
+   "Qualcomm MSM 8974 HAMMERHEAD" (AKA Snapdragon 800):
+   implementor: 0x51; variant: 0x2;  part: 0x06f
+
+   ----
+
+   Although it looks as if you should be able to do something similar
+   to POWER, instead of reading /proc, like:
+
+   #include <sys/auxv.h>
+   #include <linux/auxvec.h>  // for AT_PLATFORM
+   char * platform = NULL;
+   platform = (char*) getauxval (AT_PLATFORM);
+
+   but that just yields "v7l" on cortexa9.
+
+ */
 
 #define TEMP_BUFFER_SIZE 200
 
